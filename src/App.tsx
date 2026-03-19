@@ -27,7 +27,8 @@ import {
  Sparkles,
  Zap
 } from 'lucide-react';
-import { GoogleGenAI, Type } from "@google/genai";
+import { motion, AnimatePresence } from 'motion/react';
+import { GoogleGenAI, Type, ThinkingLevel, GenerateContentResponse } from "@google/genai";
 
 const SYSTEM_PROMPT = `Woyɛ adwumayɛfoɔ AI kwankyerɛfoɔ a wo ho akokwa (Advanced Entrepreneur AI assistant). Wo dwumadie ne sɛ wobɛkyerɛ nnipa akwan a wɔfa so hyɛ adwuma ase, wɔnyini, na wɔnsusuw ho wɔ Abibirem, titiriw Ghana.
 
@@ -43,7 +44,12 @@ Kyerɛ sika biara wɔ Ghana Cedis (GHS) mu berɛ biara.
 
 LANGUAGE DIRECTIVE:
 Provide all responses in BOTH Asante Twi and English. 
-You MUST return the response as a JSON object with exactly two keys: "twi" and "english".
+Use the following format strictly:
+TWI: [Asante Twi text]
+ENG: [English text]
+
+CONCISENESS DIRECTIVE:
+Be direct and concise. Avoid long introductions. Focus on actionable advice to minimize processing time.
 
 Suban: Kasa no mu nna hɔ, ɛnyɛ den, na ma adwumayɛfoɔ no mmodenbɔ.`;
 
@@ -58,6 +64,14 @@ interface Message {
   isSparkle?: boolean;
 }
 
+const LOADING_MESSAGES = [
+  "Meredwene ho...",
+  "Merehwehwɛ adwumayɛ akwan pa...",
+  "Merekyerɛ sika ho nhyehyɛe...",
+  "EvansAI reyɛ nhwehwɛmu...",
+  "Ubuntu nhyehyɛe reba..."
+];
+
 const App = () => {
  const [messages, setMessages] = useState<Message[]>([
    {
@@ -70,10 +84,24 @@ const App = () => {
  ]);
  const [input, setInput] = useState('');
  const [isLoading, setIsLoading] = useState(false);
+ const [loadingTextIdx, setLoadingTextIdx] = useState(0);
  const [sidebarOpen, setSidebarOpen] = useState(true);
  const [activeTab, setActiveTab] = useState('chat');
  const [sparkleLoading, setSparkleLoading] = useState<string | null>(null);
  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+ // Cycle loading messages to make the wait feel shorter
+ useEffect(() => {
+   let interval: any;
+   if (isLoading || sparkleLoading) {
+     interval = setInterval(() => {
+       setLoadingTextIdx((prev) => (prev + 1) % LOADING_MESSAGES.length);
+     }, 2000);
+   } else {
+     setLoadingTextIdx(0);
+   }
+   return () => clearInterval(interval);
+ }, [isLoading, sparkleLoading]);
 
  const scrollToBottom = () => {
    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -83,39 +111,26 @@ const App = () => {
    scrollToBottom();
  }, [messages]);
 
- const callGemini = async (userText: string, customSystemPrompt = SYSTEM_PROMPT): Promise<MessageContent> => {
-   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-   
-   try {
-     const response = await ai.models.generateContent({
-       model: "gemini-3-flash-preview",
-       contents: userText,
-       config: {
-         systemInstruction: customSystemPrompt,
-         responseMimeType: "application/json",
-         responseSchema: {
-           type: Type.OBJECT,
-           properties: {
-             twi: { type: Type.STRING },
-             english: { type: Type.STRING }
-           },
-           required: ["twi", "english"]
-         }
-       },
-     });
+ const parseBilingualResponse = (text: string): MessageContent => {
+    const twiMatch = text.match(/TWI:\s*([\s\S]*?)(?=\nENG:|$)/i);
+    const engMatch = text.match(/ENG:\s*([\s\S]*?)$/i);
+    
+    let twi = "";
+    let english = "";
 
-     if (response.text) {
-       return JSON.parse(response.text);
-     }
-     throw new Error("Empty response");
-   } catch (error) {
-     console.error("Gemini API Error:", error);
-     return {
-       twi: "Mate mfomsoɔ bi wɔ mfiridwuma no mu. Mesrɛ wo, sɔ hwɛ bio.",
-       english: "I encountered a technical error. Please try again."
-     };
-   }
- };
+    if (twiMatch) {
+      twi = twiMatch[1].trim();
+    } else if (!text.includes("ENG:")) {
+      // If we haven't seen TWI: yet, or it's just raw text during streaming
+      twi = text.replace(/TWI:\s*/i, "").trim();
+    }
+
+    if (engMatch) {
+      english = engMatch[1].trim();
+    }
+
+    return { twi, english };
+  };
 
  const handleSendMessage = async (e?: React.FormEvent, customInput?: string) => {
    e?.preventDefault();
@@ -127,17 +142,62 @@ const App = () => {
    setInput('');
    setIsLoading(true);
 
+   // Add a placeholder assistant message for streaming
+   setMessages(prev => [...prev, { 
+     role: 'assistant', 
+     content: { twi: "", english: "" } 
+   }]);
+
    try {
-     const response = await callGemini(textToSend);
-     setMessages(prev => [...prev, { role: 'assistant', content: response }]);
-   } catch (error) {
-     setMessages(prev => [...prev, {
-       role: 'assistant',
-       content: {
-         twi: "Mate mfomsoɔ bi wɔ mfiridwuma no mu. Mesrɛ wo, sɔ hwɛ bio.",
-         english: "I encountered a technical error. Please try again."
+     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+     
+     // Only send last 4 messages for faster context processing
+     const contents = [
+       ...messages.slice(-4).map(m => ({
+         role: m.role === 'user' ? 'user' : 'model',
+         parts: [{ text: typeof m.content === 'string' ? m.content : `TWI: ${m.content.twi}\nENG: ${m.content.english}` }]
+       })),
+       { role: 'user', parts: [{ text: textToSend }] }
+     ];
+
+     const stream = await ai.models.generateContentStream({
+       model: "gemini-3-flash-preview",
+       contents: contents as any,
+       config: {
+         systemInstruction: SYSTEM_PROMPT,
+         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+       },
+     });
+
+     let fullText = "";
+     for await (const chunk of stream) {
+       const c = chunk as GenerateContentResponse;
+       if (c.text) {
+         fullText += c.text;
+         const parsed = parseBilingualResponse(fullText);
+         setMessages(prev => {
+           const newMessages = [...prev];
+           newMessages[newMessages.length - 1] = {
+             role: 'assistant',
+             content: parsed
+           };
+           return newMessages;
+         });
        }
-     }]);
+     }
+   } catch (error) {
+     console.error("Gemini API Error:", error);
+     setMessages(prev => {
+       const newMessages = [...prev];
+       newMessages[newMessages.length - 1] = {
+         role: 'assistant',
+         content: {
+           twi: "Mate mfomsoɔ bi wɔ mfiridwuma no mu. Mesrɛ wo, sɔ hwɛ bio.",
+           english: "I encountered a technical error. Please try again."
+         }
+       };
+       return newMessages;
+     });
    } finally {
      setIsLoading(false);
    }
@@ -164,13 +224,41 @@ const App = () => {
        return;
    }
 
+   // Add placeholder
+   setMessages(prev => [...prev, { 
+     role: 'assistant', 
+     content: { twi: "", english: "" },
+     isSparkle: true
+   }]);
+
    try {
-     const response = await callGemini(prompt, "Woyɛ adwumayɛfoɔ kwankyerɛfoɔ. Provide responses in BOTH Asante Twi and English as JSON. Ma asɛm no nyɛ tiawa na ɛmu nna hɔ.");
-     setMessages(prev => [...prev, {
-       role: 'assistant',
-       content: response,
-       isSparkle: true
-     }]);
+     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+     const stream = await ai.models.generateContentStream({
+       model: "gemini-3-flash-preview",
+       contents: [{ role: 'user', parts: [{ text: prompt }] }] as any,
+       config: {
+         systemInstruction: "Woyɛ adwumayɛfoɔ kwankyerɛfoɔ. Provide responses in BOTH Asante Twi and English. Format: TWI: [text] ENG: [text]. Ma asɛm no nyɛ tiawa na ɛmu nna hɔ.",
+         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+       },
+     });
+
+     let fullText = "";
+     for await (const chunk of stream) {
+       const c = chunk as GenerateContentResponse;
+       if (c.text) {
+         fullText += c.text;
+         const parsed = parseBilingualResponse(fullText);
+         setMessages(prev => {
+           const newMessages = [...prev];
+           newMessages[newMessages.length - 1] = {
+             role: 'assistant',
+             content: parsed,
+             isSparkle: true
+           };
+           return newMessages;
+         });
+       }
+     }
    } catch (error) {
      console.error(error);
    } finally {
@@ -276,106 +364,126 @@ const App = () => {
 
        {/* Dynamic View */}
        <div className="flex-1 overflow-y-auto">
-         {activeTab === 'chat' && (
-           <div className="max-w-6xl mx-auto p-6 space-y-6">
-             {messages.map((msg, idx) => (
-               <div
-                 key={idx}
-                 className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-2 duration-300`}
-               >
-                 <div className={`flex gap-3 ${msg.role === 'user' ? 'max-w-[85%] flex-row-reverse' : 'w-full flex-row'}`}>
-                   <div className={`w-8 h-8 rounded-lg shrink-0 flex items-center justify-center ${msg.role === 'user' ? 'bg-emerald-600 text-white' : 'bg-white border border-slate-200 text-emerald-600 shadow-sm'}`}>
-                     {msg.role === 'user' ? <User size={18} /> : <Globe size={18} />}
-                   </div>
-                   <div className={`p-4 rounded-2xl shadow-sm flex-1 ${
-                     msg.role === 'user'
-                       ? 'bg-emerald-600 text-white rounded-tr-none max-w-fit'
-                       : msg.isSparkle ? 'bg-indigo-50 border-indigo-200 text-indigo-900 border' : 'bg-white border border-slate-200 text-slate-800 rounded-tl-none'
-                   }`}>
-                     {msg.role === 'assistant' && typeof msg.content === 'object' ? (
-                       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 divide-y md:divide-y-0 md:divide-x divide-slate-100">
-                         <div className="pb-4 md:pb-0 md:pr-6">
-                           <div className="flex items-center gap-2 mb-3">
-                             <span className="text-[10px] font-bold text-emerald-600 uppercase tracking-widest bg-emerald-50 px-2 py-0.5 rounded">Asante Twi</span>
+         <AnimatePresence mode="wait">
+           {activeTab === 'chat' ? (
+             <motion.div 
+               key="chat"
+               initial={{ opacity: 0, y: 10 }}
+               animate={{ opacity: 1, y: 0 }}
+               exit={{ opacity: 0, y: -10 }}
+               transition={{ duration: 0.2 }}
+               className="max-w-6xl mx-auto p-6 space-y-6"
+             >
+               {messages.map((msg, idx) => (
+                 <motion.div
+                   key={idx}
+                   initial={{ opacity: 0, y: 10 }}
+                   animate={{ opacity: 1, y: 0 }}
+                   className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                 >
+                   <div className={`flex gap-3 ${msg.role === 'user' ? 'max-w-[85%] flex-row-reverse' : 'w-full flex-row'}`}>
+                     <div className={`w-8 h-8 rounded-lg shrink-0 flex items-center justify-center ${msg.role === 'user' ? 'bg-emerald-600 text-white' : 'bg-white border border-slate-200 text-emerald-600 shadow-sm'}`}>
+                       {msg.role === 'user' ? <User size={18} /> : <Globe size={18} />}
+                     </div>
+                     <div className={`p-4 rounded-2xl shadow-sm flex-1 ${
+                       msg.role === 'user'
+                         ? 'bg-emerald-600 text-white rounded-tr-none max-w-fit'
+                         : msg.isSparkle ? 'bg-indigo-50 border-indigo-200 text-indigo-900 border' : 'bg-white border border-slate-200 text-slate-800 rounded-tl-none'
+                     }`}>
+                       {msg.role === 'assistant' && typeof msg.content === 'object' ? (
+                         <div className="grid grid-cols-1 md:grid-cols-2 gap-6 divide-y md:divide-y-0 md:divide-x divide-slate-100">
+                           <div className="pb-4 md:pb-0 md:pr-6">
+                             <div className="flex items-center gap-2 mb-3">
+                               <span className="text-[10px] font-bold text-emerald-600 uppercase tracking-widest bg-emerald-50 px-2 py-0.5 rounded">Asante Twi</span>
+                             </div>
+                             <div className="prose prose-sm max-w-none prose-slate whitespace-pre-wrap leading-relaxed">
+                               {msg.content.twi || (isLoading && idx === messages.length - 1 ? "..." : "")}
+                             </div>
                            </div>
-                           <div className="prose prose-sm max-w-none prose-slate whitespace-pre-wrap leading-relaxed">
-                             {msg.content.twi}
+                           <div className="pt-4 md:pt-0 md:pl-6">
+                             <div className="flex items-center gap-2 mb-3">
+                               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest bg-slate-50 px-2 py-0.5 rounded">English</span>
+                             </div>
+                             <div className="prose prose-sm max-w-none prose-slate whitespace-pre-wrap leading-relaxed italic text-slate-600">
+                               {msg.content.english || (isLoading && idx === messages.length - 1 ? "..." : "")}
+                             </div>
                            </div>
                          </div>
-                         <div className="pt-4 md:pt-0 md:pl-6">
-                           <div className="flex items-center gap-2 mb-3">
-                             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest bg-slate-50 px-2 py-0.5 rounded">English</span>
-                           </div>
-                           <div className="prose prose-sm max-w-none prose-slate whitespace-pre-wrap leading-relaxed italic text-slate-600">
-                             {msg.content.english}
-                           </div>
+                       ) : (
+                         <div className="prose prose-sm max-w-none prose-slate whitespace-pre-wrap">
+                           {typeof msg.content === 'string' ? msg.content : msg.content.english}
                          </div>
-                       </div>
-                     ) : (
-                       <div className="prose prose-sm max-w-none prose-slate whitespace-pre-wrap">
-                         {typeof msg.content === 'string' ? msg.content : msg.content.english}
-                       </div>
-                     )}
+                       )}
+                     </div>
+                   </div>
+                 </motion.div>
+               ))}
+               {isLoading && !messages[messages.length - 1].content && (
+                 <motion.div 
+                   initial={{ opacity: 0 }}
+                   animate={{ opacity: 1 }}
+                   className="flex justify-start"
+                 >
+                   <div className="flex gap-3">
+                     <div className="w-8 h-8 rounded-lg bg-white border border-slate-200 flex items-center justify-center text-emerald-400">
+                       <Globe size={18} />
+                     </div>
+                     <div className="bg-white border border-slate-200 p-4 rounded-2xl rounded-tl-none shadow-sm flex items-center gap-2">
+                        <Loader2 className="animate-spin" size={16} />
+                        <span className="text-sm text-slate-500">{LOADING_MESSAGES[loadingTextIdx]}</span>
+                     </div>
+                   </div>
+                 </motion.div>
+               )}
+               <div ref={messagesEndRef} />
+             </motion.div>
+           ) : (
+             <motion.div 
+               key="tools"
+               initial={{ opacity: 0, x: 20 }}
+               animate={{ opacity: 1, x: 0 }}
+               exit={{ opacity: 0, x: -20 }}
+               transition={{ duration: 0.2 }}
+               className="max-w-5xl mx-auto p-8 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
+             >
+               <div className="bg-gradient-to-br from-indigo-600 to-emerald-600 p-[1px] rounded-2xl shadow-lg transition-transform hover:scale-[1.02] cursor-pointer"
+                 onClick={() => quickAction("✨ Adwumayɛ akwan foforɔ nhwehwɛmu: Hwehwɛ adwumayɛ akwan foforɔ 3 a ɛbɛtumi ama nkurɔfoɔ mfasoɔ wɔ Ghana nnɛ.")}>
+                 <div className="bg-white p-6 rounded-[15px] h-full flex flex-col">
+                   <div className="w-12 h-12 bg-indigo-50 rounded-xl flex items-center justify-center mb-4">
+                     <Sparkles className="text-indigo-600" />
+                   </div>
+                   <h3 className="font-bold text-slate-800 mb-2 flex items-center gap-2">
+                     Nhwehwɛmu ✨
+                   </h3>
+                   <p className="text-sm text-slate-500 leading-relaxed mb-4">EvansAI de mfiridwuma bɛhwehwɛ adwumayɛ foforɔ ama wo.</p>
+                   <div className="mt-auto flex items-center text-indigo-600 text-sm font-bold">
+                     Hyɛ aseɛ <Zap size={14} className="ml-1" />
                    </div>
                  </div>
                </div>
-             ))}
-             {isLoading && (
-               <div className="flex justify-start animate-pulse">
-                 <div className="flex gap-3">
-                   <div className="w-8 h-8 rounded-lg bg-white border border-slate-200 flex items-center justify-center text-emerald-400">
-                     <Globe size={18} />
-                   </div>
-                   <div className="bg-white border border-slate-200 p-4 rounded-2xl rounded-tl-none shadow-sm flex items-center gap-2">
-                      <Loader2 className="animate-spin" size={16} />
-                      <span className="text-sm text-slate-500">Meredwene ho...</span>
-                   </div>
-                 </div>
-               </div>
-             )}
-             <div ref={messagesEndRef} />
-           </div>
-         )}
 
-         {activeTab === 'tools' && (
-           <div className="max-w-5xl mx-auto p-8 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-             <div className="bg-gradient-to-br from-indigo-600 to-emerald-600 p-[1px] rounded-2xl shadow-lg transition-transform hover:scale-[1.02] cursor-pointer"
-               onClick={() => quickAction("✨ Adwumayɛ akwan foforɔ nhwehwɛmu: Hwehwɛ adwumayɛ akwan foforɔ 3 a ɛbɛtumi ama nkurɔfoɔ mfasoɔ wɔ Ghana nnɛ.")}>
-               <div className="bg-white p-6 rounded-[15px] h-full flex flex-col">
-                 <div className="w-12 h-12 bg-indigo-50 rounded-xl flex items-center justify-center mb-4">
-                   <Sparkles className="text-indigo-600" />
+               {[
+                 { title: 'Market Entry', desc: 'Sɛnea wobɛtumi ahyɛ adwuma ase wɔ mpɔtam hɔ.', icon: <Users className="text-orange-500" /> },
+                 { title: 'Fintech Leapfrog', desc: 'MoMo ne mfiridwuma a yɛde di sika dwuma.', icon: <TrendingUp className="text-emerald-500" /> },
+                 { title: 'Resilience Planner', desc: 'Sɛnea wobɛsi pintinn wɔ berɛ a nneɛma yɛ den.', icon: <ShieldCheck className="text-blue-500" /> },
+                 { title: 'Export & AfCFTA', desc: 'Sɛnea wobɛtumi de nneɛma akɔ Abibirem aman afoforɔ so.', icon: <Globe className="text-indigo-500" /> },
+                 { title: 'Ubuntu Tracker', desc: 'Sɛnea wo adwuma no boa wo mpɔtam hɔfoɔ.', icon: <Lightbulb className="text-yellow-500" /> },
+                 { title: 'Legacy & Trust', desc: 'Adwuma a ɛbɛtena hɔ ama mma ne mmanana.', icon: <Briefcase className="text-slate-500" /> }
+               ].map((tool, idx) => (
+                 <div key={idx} className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm hover:shadow-md transition-all group cursor-pointer" onClick={() => quickAction(`Guide me through the ${tool.title}: ${tool.desc}`)}>
+                   <div className="w-12 h-12 bg-slate-50 rounded-xl flex items-center justify-center mb-4 group-hover:bg-emerald-50 transition-colors">
+                     {tool.icon}
+                   </div>
+                   <h3 className="font-bold text-slate-800 mb-2">{tool.title}</h3>
+                   <p className="text-sm text-slate-500 leading-relaxed mb-4">{tool.desc}</p>
+                   <div className="flex items-center text-emerald-600 text-sm font-semibold group-hover:translate-x-1 transition-transform">
+                     Hunu mu asɛm <ChevronRight size={16} />
+                   </div>
                  </div>
-                 <h3 className="font-bold text-slate-800 mb-2 flex items-center gap-2">
-                   Nhwehwɛmu ✨
-                 </h3>
-                 <p className="text-sm text-slate-500 leading-relaxed mb-4">EvansAI de mfiridwuma bɛhwehwɛ adwumayɛ foforɔ ama wo.</p>
-                 <div className="mt-auto flex items-center text-indigo-600 text-sm font-bold">
-                   Hyɛ aseɛ <Zap size={14} className="ml-1" />
-                 </div>
-               </div>
-             </div>
-
-             {[
-               { title: 'Market Entry', desc: 'Sɛnea wobɛtumi ahyɛ adwuma ase wɔ mpɔtam hɔ.', icon: <Users className="text-orange-500" /> },
-               { title: 'Fintech Leapfrog', desc: 'MoMo ne mfiridwuma a yɛde di sika dwuma.', icon: <TrendingUp className="text-emerald-500" /> },
-               { title: 'Resilience Planner', desc: 'Sɛnea wobɛsi pintinn wɔ berɛ a nneɛma yɛ den.', icon: <ShieldCheck className="text-blue-500" /> },
-               { title: 'Export & AfCFTA', desc: 'Sɛnea wobɛtumi de nneɛma akɔ Abibirem aman afoforɔ so.', icon: <Globe className="text-indigo-500" /> },
-               { title: 'Ubuntu Tracker', desc: 'Sɛnea wo adwuma no boa wo mpɔtam hɔfoɔ.', icon: <Lightbulb className="text-yellow-500" /> },
-               { title: 'Legacy & Trust', desc: 'Adwuma a ɛbɛtena hɔ ama mma ne mmanana.', icon: <Briefcase className="text-slate-500" /> }
-             ].map((tool, idx) => (
-               <div key={idx} className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm hover:shadow-md transition-all group cursor-pointer" onClick={() => quickAction(`Guide me through the ${tool.title}: ${tool.desc}`)}>
-                 <div className="w-12 h-12 bg-slate-50 rounded-xl flex items-center justify-center mb-4 group-hover:bg-emerald-50 transition-colors">
-                   {tool.icon}
-                 </div>
-                 <h3 className="font-bold text-slate-800 mb-2">{tool.title}</h3>
-                 <p className="text-sm text-slate-500 leading-relaxed mb-4">{tool.desc}</p>
-                 <div className="flex items-center text-emerald-600 text-sm font-semibold group-hover:translate-x-1 transition-transform">
-                   Hunu mu asɛm <ChevronRight size={16} />
-                 </div>
-               </div>
-             ))}
-           </div>
-         )}
+               ))}
+             </motion.div>
+           )}
+         </AnimatePresence>
        </div>
 
        {/* Input Area */}
